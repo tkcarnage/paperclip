@@ -41,6 +41,7 @@ import {
 import { pathExists, prepareManagedCodexHome, resolveManagedCodexHomeDir, resolveSharedCodexHomeDir } from "./codex-home.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
+import { parseJinriWorkspaceConfig, provisionJinriWorkspace } from "./workspace.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const CODEX_ROLLOUT_NOISE_RE =
@@ -313,8 +314,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimePrimaryUrl = asString(context.paperclipRuntimePrimaryUrl, "");
   const configuredCwd = asString(config.cwd, "");
   const useConfiguredInsteadOfAgentHome = workspaceSource === "agent_home" && configuredCwd.length > 0;
-  const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
-  const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
+  // worktreePath (server-provisioned) takes priority, then workspaceCwd, then config.cwd
+  const effectiveWorkspaceCwd = workspaceWorktreePath || (useConfiguredInsteadOfAgentHome ? "" : workspaceCwd);
+  let cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
+  // Derive issue identifier early so it can be injected into agent env
+  const issueIdentifier = asString(context.issueIdentifier, "") || asString(context.issueId, "");
   const envConfig = parseObject(config.env);
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
@@ -400,6 +404,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
   const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+  if (issueIdentifier) {
+    env.PAPERCLIP_ISSUE_IDENTIFIER = issueIdentifier;
+    env.ISSUE_IDENTIFIER = issueIdentifier;
+  }
   if (wakeTaskId) {
     env.PAPERCLIP_TASK_ID = wakeTaskId;
   }
@@ -464,6 +472,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (targetPaperclipApiUrl) {
     env.PAPERCLIP_API_URL = targetPaperclipApiUrl;
   }
+
+  // ── Adapter-side workspace provisioning ──────────────────────────────────────
+  const jinriCfg = parseJinriWorkspaceConfig(config);
+  if (jinriCfg && issueIdentifier) {
+    try {
+      const workspace = await provisionJinriWorkspace(
+        issueIdentifier,
+        jinriCfg,
+        onLog,
+        workspaceWorktreePath || undefined,
+      );
+      cwd = workspace.cwd;
+      env.DATABASE_URL = workspace.databaseUrl;
+      env.API_PORT = String(workspace.apiPort);
+      env.WEB_PORT = String(workspace.webPort);
+      env.API_URL = workspace.apiUrl;
+      env.WORKTREE_DIR = workspace.cwd;
+      env.PAPERCLIP_WORKSPACE_CWD = workspace.cwd;
+      env.PAPERCLIP_WORKSPACE_WORKTREE_PATH = workspace.cwd;
+    } catch (err) {
+      await onLog("stderr", `[paperclip] Workspace provisioning failed: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
+  }
+
   for (const [k, v] of Object.entries(envConfig)) {
     if (typeof v === "string") env[k] = v;
   }
