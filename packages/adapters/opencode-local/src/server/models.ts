@@ -14,7 +14,8 @@ const MODELS_DISCOVERY_TIMEOUT_MS = 60_000;
 const DISCOVERY_CWD = "/paperclip/workspace/jinri";
 
 // Models injected when the matching API key is present but opencode doesn't
-// auto-discover the provider (covers MiniMax and ZAI coding-plan providers).
+// auto-discover the provider (covers MiniMax and ZAI coding-plan providers,
+// see paperclipai/paperclip#1934).
 const ENV_KEYED_MODELS: Array<{ envKey: string; models: AdapterModel[] }> = [
   {
     envKey: "MINIMAX_API_KEY",
@@ -37,7 +38,8 @@ function resolveOpenCodeCommand(input: unknown): string {
 
 const discoveryCache = new Map<string, { expiresAt: number; models: AdapterModel[] }>();
 const VOLATILE_ENV_KEY_PREFIXES = ["PAPERCLIP_", "npm_", "NPM_"] as const;
-const VOLATILE_ENV_KEY_EXACT = new Set(["PWD", "OLDPWD", "SHLVL", "_", "TERM_SESSION_ID", "HOME"]);
+// USERPROFILE volatile so Windows env differences don't create spurious cache misses
+const VOLATILE_ENV_KEY_EXACT = new Set(["PWD", "OLDPWD", "SHLVL", "_", "TERM_SESSION_ID", "HOME", "USERPROFILE"]);
 
 function dedupeModels(models: AdapterModel[]): AdapterModel[] {
   const seen = new Set<string>();
@@ -68,13 +70,19 @@ function firstNonEmptyLine(text: string): string {
 
 function parseModelsOutput(stdout: string): AdapterModel[] {
   const parsed: AdapterModel[] = [];
-  for (const raw of stdout.split(/\r?\n/)) {
+  // Strip ANSI escape sequences before parsing — opencode may colorize output
+  // (fixes paperclipai/paperclip#3128 where color codes corrupted model IDs)
+  const cleanStdout = stdout.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+  for (const raw of cleanStdout.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line) continue;
-    const firstToken = line.split(/\s+/)[0]?.trim() ?? "";
-    if (!firstToken.includes("/")) continue;
-    const provider = firstToken.slice(0, firstToken.indexOf("/")).trim();
-    const model = firstToken.slice(firstToken.indexOf("/") + 1).trim();
+    // Find first token containing a slash — handles list markers ("•", "-", etc.)
+    const token = line.split(/\s+/).find((t) => t.includes("/"));
+    if (!token) continue;
+    const match = token.match(/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_.-]+)/);
+    if (!match) continue;
+    const provider = match[1];
+    const model = match[2];
     if (!provider || !model) continue;
     parsed.push({ id: `${provider}/${model}`, label: `${provider}/${model}` });
   }
@@ -137,25 +145,27 @@ export async function discoverOpenCodeModels(input: {
 } = {}): Promise<AdapterModel[]> {
   const command = resolveOpenCodeCommand(input.command);
   const env = normalizeEnv(input.env);
-  // Ensure HOME points to the actual running user's home directory.
-  // When the server is started via `runuser -u <user>`, HOME may still
-  // reflect the parent process (e.g. /root), causing OpenCode to miss
-  // provider auth credentials stored under the target user's home.
+  // Ensure HOME/USERPROFILE points to the actual running user's home directory.
+  // When started via `runuser -u <user>`, HOME may reflect the parent process.
   let resolvedHome: string | undefined;
   try {
     resolvedHome = os.userInfo().homedir || undefined;
   } catch {
-    // os.userInfo() throws a SystemError when the current UID has no
-    // /etc/passwd entry (e.g. `docker run --user 1234` with a minimal
-    // image). Fall back to process.env.HOME.
+    // os.userInfo() throws a SystemError when the UID has no /etc/passwd entry.
   }
-  const runtimeEnv = normalizeEnv(
-    ensurePathInEnv({
-      ...process.env,
-      ...env,
-      ...(resolvedHome ? { HOME: resolvedHome } : {}),
-    }),
-  );
+  const homeDir =
+    (resolvedHome && resolvedHome.trim().length > 0 ? resolvedHome : undefined) ??
+    process.env.HOME ??
+    process.env.USERPROFILE;
+  const homeEnv =
+    homeDir && homeDir.trim().length > 0
+      ? { HOME: homeDir, ...(process.platform === "win32" ? { USERPROFILE: homeDir } : {}) }
+      : {};
+
+  // Do NOT set OPENCODE_DISABLE_PROJECT_CONFIG — that flag suppresses all
+  // env-var-based provider discovery (ZAI, MiniMax, etc.), leaving only
+  // file-auth providers (GitHub Copilot OAuth) visible.
+  const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...process.env, ...env, ...homeEnv }));
 
   const result = await runChildProcess(
     `opencode-models-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -211,11 +221,29 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
     throw new Error("OpenCode requires `adapterConfig.model` in provider/model format.");
   }
 
-  const models = await discoverOpenCodeModelsCached({
+  let models = await discoverOpenCodeModelsCached({
     command: input.command,
     cwd: input.cwd,
     env: input.env,
   });
+
+  // Retry once on miss — `opencode models` loads providers asynchronously and
+  // can return a partial list on first call (paperclipai/paperclip#3602).
+  if (models.length > 0 && !models.some((entry) => entry.id === model)) {
+    const key = discoveryCacheKey(
+      resolveOpenCodeCommand(input.command),
+      normalizeEnv(input.env),
+    );
+    discoveryCache.delete(key);
+    models = await discoverOpenCodeModels({
+      command: input.command,
+      cwd: input.cwd,
+      env: input.env,
+    });
+    if (models.length > 0) {
+      discoveryCache.set(key, { expiresAt: Date.now() + MODELS_CACHE_TTL_MS, models });
+    }
+  }
 
   if (models.length === 0) {
     throw new Error("OpenCode returned no models. Run `opencode models` and verify provider auth.");
