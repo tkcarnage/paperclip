@@ -40,6 +40,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
 import { ensureOpenCodeModelConfiguredAndAvailable } from "./models.js";
+import { parseJinriWorkspaceConfig, provisionJinriWorkspace } from "./workspace.js";
 import { removeMaintainerOnlySkillSymlinks } from "@paperclipai/adapter-utils/server-utils";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 
@@ -139,9 +140,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const workspaceSource = asString(workspaceContext.source, "");
+  const workspaceStrategy = asString(workspaceContext.strategy, "");
   const workspaceId = asString(workspaceContext.workspaceId, "");
   const workspaceRepoUrl = asString(workspaceContext.repoUrl, "");
   const workspaceRepoRef = asString(workspaceContext.repoRef, "");
+  const workspaceBranch = asString(workspaceContext.branchName, "");
+  const workspaceWorktreePath = asString(workspaceContext.worktreePath, "");
   const agentHome = asString(workspaceContext.agentHome, "");
   const workspaceHints = Array.isArray(context.paperclipWorkspaces)
     ? context.paperclipWorkspaces.filter(
@@ -150,8 +154,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     : [];
   const configuredCwd = asString(config.cwd, "");
   const useConfiguredInsteadOfAgentHome = workspaceSource === "agent_home" && configuredCwd.length > 0;
-  const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
-  const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
+  // worktreePath (server-provisioned) takes priority, then workspaceCwd, then config.cwd
+  const effectiveWorkspaceCwd = workspaceWorktreePath || (useConfiguredInsteadOfAgentHome ? "" : workspaceCwd);
+  let cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
+  // Derive issue identifier early so it can be injected into agent env
+  const issueIdentifier = asString(context.issueIdentifier, "") || asString(context.issueId, "");
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
   const openCodeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredOpenCodeSkillNames = resolvePaperclipDesiredSkillNames(config, openCodeSkillEntries);
@@ -192,6 +199,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
   const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+  if (issueIdentifier) {
+    env.PAPERCLIP_ISSUE_IDENTIFIER = issueIdentifier;
+    env.ISSUE_IDENTIFIER = issueIdentifier;  // shorthand used in harness skill
+  }
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
   if (wakeReason) env.PAPERCLIP_WAKE_REASON = wakeReason;
   if (wakeCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = wakeCommentId;
@@ -205,7 +216,41 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (workspaceRepoUrl) env.PAPERCLIP_WORKSPACE_REPO_URL = workspaceRepoUrl;
   if (workspaceRepoRef) env.PAPERCLIP_WORKSPACE_REPO_REF = workspaceRepoRef;
   if (agentHome) env.AGENT_HOME = agentHome;
+  if (workspaceStrategy) env.PAPERCLIP_WORKSPACE_STRATEGY = workspaceStrategy;
+  if (workspaceBranch) env.PAPERCLIP_WORKSPACE_BRANCH = workspaceBranch;
+  if (workspaceWorktreePath) env.PAPERCLIP_WORKSPACE_WORKTREE_PATH = workspaceWorktreePath;
   if (workspaceHints.length > 0) env.PAPERCLIP_WORKSPACES_JSON = JSON.stringify(workspaceHints);
+
+  // ── Adapter-side workspace provisioning ──────────────────────────────────────
+  // Handles two cases:
+  //  A) Server provisioned the git worktree (workspaceWorktreePath set via git_worktree policy)
+  //     → skip git worktree creation, only provision DB + API in that path
+  //  B) No server worktree (shared_workspace or legacy policy)
+  //     → full provisioning: git worktree + DB + API
+  //
+  // jinriWorkspace in adapter_config enables this; without it the block is a no-op.
+  const jinriCfg = parseJinriWorkspaceConfig(config);
+  if (jinriCfg && issueIdentifier) {
+    try {
+      const workspace = await provisionJinriWorkspace(
+        issueIdentifier,
+        jinriCfg,
+        onLog,
+        workspaceWorktreePath || undefined,  // pass server worktree path if available
+      );
+      cwd = workspace.cwd;
+      env.DATABASE_URL = workspace.databaseUrl;
+      env.API_PORT = String(workspace.apiPort);
+      env.WEB_PORT = String(workspace.webPort);
+      env.API_URL = workspace.apiUrl;
+      env.WORKTREE_DIR = workspace.cwd;
+      env.PAPERCLIP_WORKSPACE_CWD = workspace.cwd;
+      env.PAPERCLIP_WORKSPACE_WORKTREE_PATH = workspace.cwd;
+    } catch (err) {
+      await onLog("stderr", `[paperclip] Workspace provisioning failed: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
+  }
+
   const targetPaperclipApiUrl = adapterExecutionTargetPaperclipApiUrl(executionTarget);
   if (targetPaperclipApiUrl) env.PAPERCLIP_API_URL = targetPaperclipApiUrl;
 
@@ -470,6 +515,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             ...(workspaceId ? { workspaceId } : {}),
             ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
             ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+            ...(workspaceBranch ? { branchName: workspaceBranch } : {}),
+            ...(workspaceWorktreePath ? { worktreePath: workspaceWorktreePath } : {}),
             ...(executionTargetIsRemote
               ? {
                   remoteExecution: adapterExecutionTargetSessionIdentity(executionTarget),
