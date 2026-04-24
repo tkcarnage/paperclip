@@ -7,8 +7,24 @@ import {
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 
-const MODELS_CACHE_TTL_MS = 60_000;
-const MODELS_DISCOVERY_TIMEOUT_MS = 20_000;
+const MODELS_CACHE_TTL_MS = 300_000;
+const MODELS_DISCOVERY_TIMEOUT_MS = 60_000;
+
+// Stable cwd prevents per-worktree cache misses; model discovery doesn't use cwd.
+const DISCOVERY_CWD = "/paperclip/workspace/jinri";
+
+// Models injected when the matching API key is present but opencode doesn't
+// auto-discover the provider (covers MiniMax and ZAI coding-plan providers).
+const ENV_KEYED_MODELS: Array<{ envKey: string; models: AdapterModel[] }> = [
+  {
+    envKey: "MINIMAX_API_KEY",
+    models: [{ id: "minimax-coding-plan/MiniMax-M2.7", label: "MiniMax M2.7 (coding-plan)" }],
+  },
+  {
+    envKey: "ZHIPU_API_KEY",
+    models: [{ id: "zai-coding-plan/glm-5.1", label: "ZAI GLM-5.1 (coding-plan)" }],
+  },
+];
 
 function resolveOpenCodeCommand(input: unknown): string {
   const envOverride =
@@ -85,13 +101,14 @@ function hashValue(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function discoveryCacheKey(command: string, cwd: string, env: Record<string, string>) {
+function discoveryCacheKey(command: string, env: Record<string, string>) {
   const envKey = Object.entries(env)
     .filter(([key]) => !isVolatileEnvKey(key))
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([key, value]) => `${key}=${hashValue(value)}`)
     .join("\n");
-  return `${command}\n${cwd}\n${envKey}`;
+  // cwd intentionally omitted — discovery uses DISCOVERY_CWD and is env-driven.
+  return `${command}\n${envKey}`;
 }
 
 function pruneExpiredDiscoveryCache(now: number) {
@@ -100,13 +117,25 @@ function pruneExpiredDiscoveryCache(now: number) {
   }
 }
 
+function injectEnvKeyedModels(
+  discovered: AdapterModel[],
+  runtimeEnv: Record<string, string>,
+): AdapterModel[] {
+  const extra: AdapterModel[] = [];
+  for (const { envKey, models } of ENV_KEYED_MODELS) {
+    if (runtimeEnv[envKey] || process.env[envKey]) {
+      extra.push(...models);
+    }
+  }
+  return dedupeModels([...discovered, ...extra]);
+}
+
 export async function discoverOpenCodeModels(input: {
   command?: unknown;
   cwd?: unknown;
   env?: unknown;
 } = {}): Promise<AdapterModel[]> {
   const command = resolveOpenCodeCommand(input.command);
-  const cwd = asString(input.cwd, process.cwd());
   const env = normalizeEnv(input.env);
   // Ensure HOME points to the actual running user's home directory.
   // When the server is started via `runuser -u <user>`, HOME may still
@@ -120,15 +149,20 @@ export async function discoverOpenCodeModels(input: {
     // /etc/passwd entry (e.g. `docker run --user 1234` with a minimal
     // image). Fall back to process.env.HOME.
   }
-  // Prevent OpenCode from writing an opencode.json into the working directory.
-  const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...process.env, ...env, ...(resolvedHome ? { HOME: resolvedHome } : {}), OPENCODE_DISABLE_PROJECT_CONFIG: "true" }));
+  const runtimeEnv = normalizeEnv(
+    ensurePathInEnv({
+      ...process.env,
+      ...env,
+      ...(resolvedHome ? { HOME: resolvedHome } : {}),
+    }),
+  );
 
   const result = await runChildProcess(
     `opencode-models-${Date.now()}-${Math.random().toString(16).slice(2)}`,
     command,
     ["models"],
     {
-      cwd,
+      cwd: DISCOVERY_CWD,
       env: runtimeEnv,
       timeoutSec: MODELS_DISCOVERY_TIMEOUT_MS / 1000,
       graceSec: 3,
@@ -144,7 +178,8 @@ export async function discoverOpenCodeModels(input: {
     throw new Error(detail ? `\`opencode models\` failed: ${detail}` : "`opencode models` failed.");
   }
 
-  return sortModels(parseModelsOutput(result.stdout));
+  const discovered = sortModels(parseModelsOutput(result.stdout));
+  return sortModels(injectEnvKeyedModels(discovered, runtimeEnv));
 }
 
 export async function discoverOpenCodeModelsCached(input: {
@@ -153,15 +188,14 @@ export async function discoverOpenCodeModelsCached(input: {
   env?: unknown;
 } = {}): Promise<AdapterModel[]> {
   const command = resolveOpenCodeCommand(input.command);
-  const cwd = asString(input.cwd, process.cwd());
   const env = normalizeEnv(input.env);
-  const key = discoveryCacheKey(command, cwd, env);
+  const key = discoveryCacheKey(command, env);
   const now = Date.now();
   pruneExpiredDiscoveryCache(now);
   const cached = discoveryCache.get(key);
   if (cached && cached.expiresAt > now) return cached.models;
 
-  const models = await discoverOpenCodeModels({ command, cwd, env });
+  const models = await discoverOpenCodeModels({ command, env });
   discoveryCache.set(key, { expiresAt: now + MODELS_CACHE_TTL_MS, models });
   return models;
 }
