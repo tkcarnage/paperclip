@@ -61,3 +61,9 @@ jinri-worktrees/
 *.tsbuildinfo
 *.log
 .DS_Store
+
+# Per-issue isolated worktrees (created by workspace provisioner)
+jinri-worktrees/
+*.tsbuildinfo
+*.log
+.DS_Store
