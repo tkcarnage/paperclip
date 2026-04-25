@@ -55,3 +55,9 @@ tests/release-smoke/test-results/
 tests/release-smoke/playwright-report/
 .superset/
 .claude/worktrees/
+
+# Per-issue isolated worktrees (created by workspace provisioner)
+jinri-worktrees/
+*.tsbuildinfo
+*.log
+.DS_Store
