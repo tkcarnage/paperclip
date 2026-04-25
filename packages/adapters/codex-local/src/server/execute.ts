@@ -480,25 +480,41 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Resolve the formatted issue identifier (e.g. "THE-21") for workspace provisioning.
   // context.issueIdentifier is set for most wake types; for wakeup requests that only
   // carry issueId (UUID) we fall back to a Paperclip API lookup.
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   let workspaceIssueIdentifier = asString(context.issueIdentifier, "");
+  if (UUID_RE.test(workspaceIssueIdentifier)) workspaceIssueIdentifier = "";
   if (!workspaceIssueIdentifier && jinriCfg) {
-    const rawIssueId = asString(context.issueId, "") || asString(context.taskId, "");
-    const paperclipApiUrl = asString(process.env.PAPERCLIP_API_URL, "") || `http://localhost:${process.env.PORT ?? "3100"}`;
-    const paperclipApiKey = authToken || asString(process.env.PAPERCLIP_API_KEY, "");
-    if (rawIssueId && paperclipApiUrl && paperclipApiKey) {
+    const wakePayloadRaw = asString(process.env.PAPERCLIP_WAKE_PAYLOAD_JSON, "");
+    if (wakePayloadRaw) {
       try {
-        const resp = await fetch(`${paperclipApiUrl}/api/issues/${rawIssueId}`, {
-          headers: { Authorization: `Bearer ${paperclipApiKey}` },
-        });
-        if (resp.ok) {
-          const issue = await resp.json() as Record<string, unknown>;
-          const identifier = typeof issue.identifier === "string" ? issue.identifier : "";
-          if (identifier) {
-            workspaceIssueIdentifier = identifier;
-            await onLog("stdout", `[workspace] Resolved issue identifier from API: ${identifier}\n`);
-          }
+        const wp = JSON.parse(wakePayloadRaw) as Record<string, unknown>;
+        const issueInPayload = wp.issue as Record<string, unknown> | undefined;
+        const idFromPayload = typeof issueInPayload?.identifier === "string" ? issueInPayload.identifier : "";
+        if (idFromPayload && !UUID_RE.test(idFromPayload)) {
+          workspaceIssueIdentifier = idFromPayload;
+          await onLog("stdout", `[workspace] Resolved issue identifier from wake payload: ${idFromPayload}\n`);
         }
-      } catch { /* silently skip */ }
+      } catch { /* malformed payload — fall through to API */ }
+    }
+    if (!workspaceIssueIdentifier) {
+      const rawIssueId = asString(context.issueId, "") || asString(context.taskId, "");
+      const paperclipApiUrl = asString(process.env.PAPERCLIP_API_URL, "") || `http://localhost:${process.env.PORT ?? "3100"}`;
+      const paperclipApiKey = authToken || asString(process.env.PAPERCLIP_API_KEY, "");
+      if (rawIssueId && paperclipApiUrl && paperclipApiKey) {
+        try {
+          const resp = await fetch(`${paperclipApiUrl}/api/issues/${rawIssueId}`, {
+            headers: { Authorization: `Bearer ${paperclipApiKey}` },
+          });
+          if (resp.ok) {
+            const issue = await resp.json() as Record<string, unknown>;
+            const identifier = typeof issue.identifier === "string" ? issue.identifier : "";
+            if (identifier && !UUID_RE.test(identifier)) {
+              workspaceIssueIdentifier = identifier;
+              await onLog("stdout", `[workspace] Resolved issue identifier from API: ${identifier}\n`);
+            }
+          }
+        } catch { /* silently skip */ }
+      }
     }
   }
   if (jinriCfg && workspaceIssueIdentifier) {
@@ -515,6 +531,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       env.WEB_PORT = String(workspace.webPort);
       env.API_URL = workspace.apiUrl;
       env.WORKTREE_DIR = workspace.cwd;
+      env.ISSUE_IDENTIFIER = workspaceIssueIdentifier;
+      env.PAPERCLIP_ISSUE_IDENTIFIER = workspaceIssueIdentifier;
       env.PAPERCLIP_WORKSPACE_CWD = workspace.cwd;
       env.PAPERCLIP_WORKSPACE_WORKTREE_PATH = workspace.cwd;
     } catch (err) {
