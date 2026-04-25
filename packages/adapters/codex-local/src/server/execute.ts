@@ -483,7 +483,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let workspaceIssueIdentifier = asString(context.issueIdentifier, "");
   if (!workspaceIssueIdentifier && jinriCfg) {
     const rawIssueId = asString(context.issueId, "") || asString(context.taskId, "");
-    const paperclipApiUrl = asString(process.env.PAPERCLIP_API_URL, "");
+    const paperclipApiUrl = asString(process.env.PAPERCLIP_API_URL, "") || `http://localhost:${process.env.PORT ?? "3100"}`;
     const paperclipApiKey = authToken || asString(process.env.PAPERCLIP_API_KEY, "");
     if (rawIssueId && paperclipApiUrl && paperclipApiKey) {
       try {
