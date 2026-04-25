@@ -232,7 +232,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const jinriCfg = parseJinriWorkspaceConfig(config);
   // Only use issueIdentifier if it looks like a Paperclip identifier (e.g. "THE-21"),
   // not a raw UUID — context.issueId is a UUID fallback we must not pass to the provisioner.
-  const workspaceIssueIdentifier = asString(context.issueIdentifier, "");
+  // Resolve the formatted issue identifier (e.g. "THE-21") for workspace provisioning.
+  // context.issueIdentifier is set for most wake types; for wakeup requests that only
+  // carry issueId (UUID) we fall back to a Paperclip API lookup.
+  let workspaceIssueIdentifier = asString(context.issueIdentifier, "");
+  if (!workspaceIssueIdentifier && jinriCfg) {
+    const rawIssueId = asString(context.issueId, "") || asString(context.taskId, "");
+    const paperclipApiUrl = asString(process.env.PAPERCLIP_API_URL, "");
+    const paperclipApiKey = authToken || asString(process.env.PAPERCLIP_API_KEY, "");
+    if (rawIssueId && paperclipApiUrl && paperclipApiKey) {
+      try {
+        const resp = await fetch(`${paperclipApiUrl}/api/issues/${rawIssueId}`, {
+          headers: { Authorization: `Bearer ${paperclipApiKey}` },
+        });
+        if (resp.ok) {
+          const issue = await resp.json() as Record<string, unknown>;
+          const identifier = typeof issue.identifier === "string" ? issue.identifier : "";
+          if (identifier) {
+            workspaceIssueIdentifier = identifier;
+            await onLog("stdout", `[workspace] Resolved issue identifier from API: ${identifier}\n`);
+          }
+        }
+      } catch { /* silently skip */ }
+    }
+  }
   if (jinriCfg && workspaceIssueIdentifier) {
     try {
       const workspace = await provisionJinriWorkspace(
