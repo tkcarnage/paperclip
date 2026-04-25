@@ -71,7 +71,7 @@ function parseIssueNum(id: string): number | null {
   if (!m) return null;
   const n = parseInt(m[1], 10);
   // Sanity cap: real issue numbers are small; UUID trailing segments are large hex
-  return !isNaN(n) && n > 0 && n < 100_000 ? n : null;
+  return !isNaN(n) && n > 0 && n < 5_000 ? n : null;
 }
 
 async function pathExists(p: string): Promise<boolean> {
@@ -149,16 +149,24 @@ export async function provisionJinriWorkspace(
       execFileSync("git", ["-C", cfg.repoPath, "fetch", "origin", "main", "--quiet"], { stdio: "pipe" });
       execFileSync(
         "git",
-        ["-C", cfg.repoPath, "worktree", "add", worktreePath, "-b", branchName, "origin/main"],
+        ["-C", cfg.repoPath, "worktree", "add", "-b", branchName, worktreePath, "origin/main"],
         { stdio: "pipe" },
       );
     } catch {
-      // Branch may already exist — attach without creating a new one
-      execFileSync(
-        "git",
-        ["-C", cfg.repoPath, "worktree", "add", worktreePath, branchName],
-        { stdio: "pipe" },
-      );
+      // Branch may already exist — attach to it; if not, create from HEAD
+      try {
+        execFileSync(
+          "git",
+          ["-C", cfg.repoPath, "worktree", "add", worktreePath, branchName],
+          { stdio: "pipe" },
+        );
+      } catch {
+        execFileSync(
+          "git",
+          ["-C", cfg.repoPath, "worktree", "add", "-b", branchName, worktreePath, "HEAD"],
+          { stdio: "pipe" },
+        );
+      }
     }
   } else {
     await onLog("stdout", `[workspace] Reusing worktree at ${worktreePath}\n`);

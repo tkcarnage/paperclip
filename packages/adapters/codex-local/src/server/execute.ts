@@ -475,10 +475,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   // ── Adapter-side workspace provisioning ──────────────────────────────────────
   const jinriCfg = parseJinriWorkspaceConfig(config);
-  if (jinriCfg && issueIdentifier) {
+  // Only use issueIdentifier if it looks like a Paperclip identifier (e.g. "THE-21"),
+  // not a raw UUID — context.issueId is a UUID fallback we must not pass to the provisioner.
+  const workspaceIssueIdentifier = asString(context.issueIdentifier, "");
+  if (jinriCfg && workspaceIssueIdentifier) {
     try {
       const workspace = await provisionJinriWorkspace(
-        issueIdentifier,
+        workspaceIssueIdentifier,
         jinriCfg,
         onLog,
         workspaceWorktreePath || undefined,
